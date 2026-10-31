@@ -59,9 +59,53 @@ class FallbackLevel(BaseLevel):
         })
 
 
+#: Корень папки levels/ (здесь лежат module1 … module6 и level_XX.py).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+#: Кэш уже загруженных уровней: {номер: экземпляр}.
+_CACHE = {}
+
+
+def _candidate_paths(number):
+    """Все пути, где может лежать файл уровня ``number``.
+
+    Порядок поиска:
+      1. levels/moduleN/level_XX.py — уроки, отсортированные по модулям КТП;
+      2. levels/level_XX.py         — исторический плоский формат.
+    """
+    name = "level_%02d.py" % number
+    paths = [os.path.join(_HERE, "module%d" % m, name) for m in range(1, 7)]
+    paths.append(os.path.join(_HERE, name))
+    return paths
+
+
 def _module_path(number):
-    here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(here, "level_%02d.py" % number)
+    """Первый существующий путь к файлу уровня (или None)."""
+    for p in _candidate_paths(number):
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _instantiate_from_file(path, number):
+    """Загрузить файл уровня и вернуть экземпляр его BaseLevel-класса."""
+    fname = os.path.splitext(os.path.basename(path))[0]           # level_05
+    parent = os.path.basename(os.path.dirname(path))              # module1 / levels
+    mod_name = "levels.%s.%s" % (parent, fname) if parent != "levels" \
+        else "levels.%s" % fname
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    for attr in vars(module).values():
+        if (isinstance(attr, type) and issubclass(attr, BaseLevel)
+                and attr is not BaseLevel
+                and getattr(attr, "LEVEL_NUMBER", number) == number):
+            obj = attr()
+            if isinstance(obj, BaseLevel):
+                obj.number = number
+                return obj
+    return None
 
 
 def load_level(number):
@@ -69,32 +113,34 @@ def load_level(number):
     number = int(number)
     if not (1 <= number <= TOTAL_LEVELS):
         return None
-    # 1) внешний специализированный модуль level_XX.py
+    if number in _CACHE:
+        return _CACHE[number]
+    # 1) специализированный файл уровня (levels/moduleN/level_XX.py или levels/level_XX.py)
     path = _module_path(number)
-    if os.path.isfile(path):
+    if path is not None:
         try:
-            spec = importlib.util.spec_from_file_location(
-                "levels.level_%02d" % number, path)
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = module
-            spec.loader.exec_module(module)
-            for attr in vars(module).values():
-                if (isinstance(attr, type) and issubclass(attr, BaseLevel)
-                        and attr is not BaseLevel
-                        and getattr(attr, "LEVEL_NUMBER", number) == number):
-                    obj = attr()
-                    if isinstance(obj, BaseLevel):
-                        obj.number = number
-                        return obj
+            obj = _instantiate_from_file(path, number)
+            if obj is not None:
+                _CACHE[number] = obj
+                return obj
         except Exception:               # noqa: BLE001
             traceback.print_exc()
     # 2) описание из реестра КТП
     if ktp_registry is not None:
-        desc = ktp_registry.get_level_description(number)
+        try:
+            desc = ktp_registry.get_level_description(number)
+        except Exception:               # noqa: BLE001
+            traceback.print_exc()
+            desc = None
         if desc:
-            return BaseLevel(desc)
-    # 3) заглушка
-    return FallbackLevel(number)
+            obj = BaseLevel(desc)
+            obj.number = number
+            _CACHE[number] = obj
+            return obj
+    # 3) заглушка — игра никогда не «падает» на missing-уроке
+    obj = FallbackLevel(number)
+    _CACHE[number] = obj
+    return obj
 
 
 def load_all():

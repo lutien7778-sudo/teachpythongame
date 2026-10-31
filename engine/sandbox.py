@@ -210,67 +210,102 @@ class _LoopGuardTransformer(ast.NodeTransformer):
         ctr = self._new_counter()
         ln = getattr(node, "lineno", 1) or 1
         col = getattr(node, "col_offset", 0) or 0
-        incr = ast.parse("%s += 1" % ctr).body[0]
-        chk = ast.parse(
-            "raise SandboxLoopLimit('%s', %d)" % (ctr, self.limit)
-        ).body[0]
-        guard = ast.If(test=ast.parse("%s > %d" % (ctr, self.limit))
-                       .body[0].value, body=[chk], orelse=[])
-        self._set_coords(incr, ln, col)
-        self._set_coords(chk, ln, col)
-        self._set_coords(guard, ln, col)
+
+        def mk(stmt_src):
+            st = ast.parse(stmt_src).body[0]
+            for n in ast.walk(st):
+                self._set_coords(n, ln, col)
+            return st
+
+        # Счётчик хранится в служебном dict __nova_loop_counters (его
+        # создаёт песочница), а не в globals ученика: инкремент — выражение
+        # list.append(...), возвращающее новое значение длины, поэтому его
+        # можно использовать прямо в условии if. После выхода из цикла
+        # (нормальный конец, break или исключение) finally удаляет запись —
+        # «мусор» не копится, повторные запуски получают свежий счётчик.
+        tick = ast.Call(                     # len-счётчик: [0].append(None) == 1
+            func=ast.Attribute(
+                value=ast.Subscript(
+                    value=ast.Name(id="__nova_loop_counters", ctx=ast.Load()),
+                    slice=ast.Constant(value=ctr), ctx=ast.Load()),
+                attr="append", ctx=ast.Load()),
+            args=[ast.Constant(value=None)], keywords=[])
+        guard = ast.If(test=ast.Compare(
+            left=tick, ops=[ast.Gt()],
+            comparators=[ast.Constant(value=self.limit)]),
+            body=[mk("raise SandboxLoopLimit('%s', %d)" % (ctr, self.limit))],
+            orelse=[])
+        for n in ast.walk(guard):
+            self._set_coords(n, ln, col)
 
         body = list(node.body)
         # уже обёрнуто? (защита от повторного прохода) — не оборачиваем дважды
         if body and self._is_guard_raise(body[-1]):
             return node
-        if isinstance(node, ast.While):
-            # while (__ctr := 0) < LIMIT and <условие ученика>:
-            init = ast.Named(target=ast.Name(id=ctr, ctx=ast.Store()),
-                             value=ast.Constant(value=0))
-            self._set_coords(init, ln, col)
-            cmp_ = ast.Compare(left=init, ops=[ast.Lt()],
-                               comparators=[ast.Constant(value=self.limit)])
-            self._set_coords(cmp_, ln, col)
-            test = ast.BoolOp(op=ast.And(), values=[cmp_, node.test])
-            self._set_coords(test, ln, col)
-            node.test = test
-            node.body = body + [incr, guard]
-        else:
-            # for ...: тело; инкремент+проверка; else: __ctr = 0 (сброс)
-            reset = ast.parse("%s = 0" % ctr).body[0]
-            self._set_coords(reset, ln, col)
-            node.body = body + [incr, guard]
-            node.orelse = list(node.orelse) + [reset]
-        return node
+        node.body = body + [guard]
+        register = mk("__nova_loop_counters['%s'] = []" % ctr)
+        unregister = mk("__nova_loop_counters.pop('%s', None)" % ctr)
+        cleanup = ast.Try(body=[node], handlers=[], orelse=[],
+                          finalbody=[unregister])
+        self._set_coords(cleanup, ln, col)
+        return register, cleanup
+
+    def _instrument_tree(self, body_list):
+        """Обойти список операторов; вернуть новый список с вставками счётчиков."""
+        out = []
+        for stmt in body_list:
+            if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                inner = self._instrument_tree(stmt.body)
+                if inner is not stmt.body:
+                    stmt.body = inner
+                new = self._instrument_loop(stmt)
+                if isinstance(new, tuple):
+                    out.extend(new)
+                elif new is not None:
+                    out.append(new)
+            else:
+                # рекурсивно спускаемся во все составные операторы
+                for field, value in ast.iter_fields(stmt):
+                    if isinstance(value, list):
+                        newlist = self._instrument_tree(value)
+                        setattr(stmt, field, newlist)
+                out.append(stmt)
+        return out
 
     def visit_Module(self, node):
         """Обойти все циклы дерева (включая вложенные) и вернуть тот же Module.
 
         Важно: возвращаем исходный узел Module, а не новый Module внутри
         другого Module — иначе NodeTransformer построит недопустимое дерево
-        и compile() упадёт с «required field "lineno" missing from stmt».
+        и compile() упадёт с «required field \"lineno\" missing from stmt».
         """
-        for i, stmt in enumerate(list(node.body)):
-            new = self.visit(stmt)
-            if new is not None and new is not stmt:
-                node.body[i] = new
-        # инициализация счётчиков вынесена в walrus-выражения внутри тел,
-        # поэтому дополнительных операторов на уровне модуля не нужно
+        node.body = self._instrument_tree(node.body)
         ast.fix_missing_locations(node)
         return node
 
+    def visit_FunctionDef(self, node):
+        node.body = self._instrument_tree(node.body)
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        node.body = self._instrument_tree(node.body)
+        return node
+
     def visit_For(self, node):
-        self.generic_visit(node)          # сначала обработаем вложенные циклы
-        return self._instrument_loop(node)
+        # вызывается только через _instrument_tree; на прямые generic_visit
+        # пути оставляем безопасное поведение — обойти вложенные и обернуть
+        inner = self._instrument_tree(node.body)
+        node.body = inner
+        res = self._instrument_loop(node)
+        return res[1] if isinstance(res, tuple) else res
 
     def visit_AsyncFor(self, node):
-        self.generic_visit(node)
-        return self._instrument_loop(node)
+        return self.visit_For(node)
 
     def visit_While(self, node):
-        self.generic_visit(node)
-        return self._instrument_loop(node)
+        return self.visit_For(node)
 
 
 class _ForbiddenFinder(ast.NodeVisitor):
