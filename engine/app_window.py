@@ -13,8 +13,16 @@ Tkinter, 1150x750, тема GitHub Dark (#0d1117):
 Только стандартная библиотека Python 3.8+.
 """
 
+import os
+import sys
 import tkinter as tk
 from tkinter import ttk, font as tkfont, messagebox
+
+# Запуск из Thonny (F5) или из произвольного каталога: кладём корень проекта
+# в sys.path, чтобы импорты engine/levels работали всегда.
+_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 from engine.state_manager import StateManager, TOTAL_LEVELS
 from engine.sandbox import CodeSandbox
@@ -88,6 +96,7 @@ class NovaTerraApp(object):
         self.boss_scene = None
         self.editor_bufs = {}             # черновики кода по номеру задачи
 
+        self.input_awaiting = False       # ждём ответ на read()/input() из кода
         self._setup_theme()
         self._build_hud()
         self._build_left_panel()
@@ -95,6 +104,8 @@ class NovaTerraApp(object):
         self.sandbox = CodeSandbox(output_callback=self.shell_write)
         # объект арены доступен в коде ученика (уроки 17–34)
         self.sandbox.inject(canvas=self.sim)
+        #: эмуляция input(): учебная функция read() вызывает этот колбэк
+        self.sandbox.globals["read"] = self._sandbox_read
 
         self._ask_name_if_empty()
         self.open_level(min(self.state.current_level,
@@ -372,6 +383,39 @@ class NovaTerraApp(object):
     def set_status(self, text):
         self.statusbar.config(text=text)
 
+    # ------------------------------------------------- эмуляция input()
+    def _sandbox_read(self, prompt=u"Введи значение: "):
+        """Учебная замена input(): модальное окно ввода в GUI.
+
+        Вызывается синхронно из кода ученика внутри песочницы; блокирует
+        выполнение до нажатия «Отправить» (Esc = пустая строка).
+        """
+        box = tk.Toplevel(self.root)
+        box.title(u"Ввод данных — Нова-Терра")
+        box.geometry("420x150")
+        box.configure(bg=PANEL)
+        box.resizable(False, False)
+        box.transient(self.root)
+        tk.Label(box, text=str(prompt), bg=PANEL, fg=FG, wraplength=390,
+                 justify="left", font=self.ui_font).pack(pady=(10, 4))
+        entry = tk.Entry(box, bg=BG, fg=GREEN, insertbackground=GREEN,
+                         font=("Courier", 12))
+        entry.pack(padx=16, ipady=3, fill="x")
+        entry.focus_force()
+        holder = {"value": None}
+
+        def send(event=None):
+            holder["value"] = entry.get()
+            box.destroy()
+
+        entry.bind("<Return>", send)
+        box.bind("<Escape>", lambda e: send())
+        ttk.Button(box, text=u"Отправить ⏎", command=send).pack(pady=8)
+        box.wait_window()
+        value = holder["value"] if holder["value"] is not None else ""
+        self.shell_write(u"> %s" % value, "sys")
+        return value
+
     # ------------------------------------------------------- выбор уровня
     def on_pick_level(self):
         raw = self.level_combo.get()
@@ -430,6 +474,9 @@ class NovaTerraApp(object):
 
     # -------------------------------------------------- этап 2: симулятор
     def render_simulator(self):
+        # уроки с живой лентой (уровень 1) пересобирают спеку из кода редактора
+        if hasattr(self.level, "set_student_code"):
+            self.level.set_student_code(self.current_editor_code())
         spec = self.level.get_simulator_spec() or {}
         mode = spec.get("mode", "memory")
         if mode == "pgzero":
@@ -493,7 +540,15 @@ class NovaTerraApp(object):
         task = self.level.get_task(self.task_index)
         code = self.current_editor_code()
         self.editor_bufs[self.task_index] = code
-        ok, feedback = BaseLevel.check_task(task, self.sandbox, code)
+        if hasattr(self.level, "check_task"):
+            # уровень может уточнять автопроверку (своя обратная связь)
+            try:
+                ok, feedback = self.level.check_task(
+                    self.sandbox, code, self.task_index)
+            except TypeError:      # сигнатура BaseLevel.check_task(task, ...)
+                ok, feedback = self.level.check_task(task, self.sandbox, code)
+        else:
+            ok, feedback = BaseLevel.check_task(task, self.sandbox, code)
         self.shell_write(feedback, "ok" if ok else "err")
         if ok:
             self.state.add_xp(10)
@@ -533,14 +588,25 @@ class NovaTerraApp(object):
         else:
             code = self.current_editor_code()
             self.shell_write(u"БОСС-МИССИЯ (консоль): проверяю код…", "sys")
-            virtual_task = {
-                "prompt": spec.get("desc", ""),
-                "expect_print": spec.get("expect_print", []),
-                "expect_vars": spec.get("expect_vars", {}),
-                "forbidden": spec.get("forbidden", []),
-            }
-            ok, feedback = BaseLevel.check_task(virtual_task, self.sandbox,
-                                                code)
+            checker = getattr(self.level, "check_console_boss", None)
+            if callable(checker):
+                spec = self.level.get_boss_spec() or {}
+                feed = getattr(self.sandbox, "feed_input", None)
+                if callable(feed) and spec.get("inputs"):
+                    feed(*spec["inputs"])   # эмуляция ввода пульта для босса
+                ok, feedback = checker(self.sandbox, code)
+            else:
+                virtual_task = {
+                    "prompt": spec.get("desc", ""),
+                    "expect_print": spec.get("expect_print", []),
+                    "expect_vars": spec.get("expect_vars", {}),
+                    "forbidden": spec.get("forbidden", []),
+                    "forbidden_print": spec.get("forbidden_print", []),
+                    "require_comment": spec.get("require_comment", False),
+                    "comment_keywords": spec.get("comment_keywords"),
+                }
+                ok, feedback = BaseLevel.check_task(virtual_task, self.sandbox,
+                                                    code)
             self.shell_write(feedback, "ok" if ok else "err")
             if ok:
                 self.complete_stage(3, quiet=True)

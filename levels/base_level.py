@@ -165,6 +165,44 @@ class BaseLevel(object):
             if not any(any(k.lower() in c for k in keywords) for c in commented):
                 return False, u"Команду нельзя удалять — отключи её комментарием: " \
                               u"поставь решётку # в начало нужной строки."
+        #: количество строк вывода (например, «ровно 2 строки»)
+        count = task.get("expect_print_count")
+        if count is not None and len(printed) != int(count):
+            return False, u"Программа должна вывести ровно %d стр(ок), " \
+                          u"а вывела %d. Лишние команды отключи комментарием #." \
+                          % (int(count), len(printed))
+        #: проверка значений переменных без print(): dict {имя: ожидаемое}
+        for name, expected in task.get("assert_vars", {}).items():
+            found, value = sandbox.eval_expr(name)
+            if not found:
+                return False, u"Переменная «%s» не создана — посчитай её в коде " \
+                              u"до проверки." % name
+            if value != expected:
+                return False, u"«%s» = %r, а на этой карте Нова-Терры должно " \
+                              u"быть %r." % (name, value, expected)
+        #: проверка типа значения: dict {имя: "int" | "float" | "str" | "bool"}
+        for name, tname in task.get("expect_types", {}).items():
+            found, value = sandbox.eval_expr(name)
+            if not found:
+                return False, u"Переменная «%s» не найдена." % name
+            actual = type(value).__name__
+            if actual != tname:
+                return False, u"«%s» имеет тип %s, а нужен тип %s. " \
+                              u"Вспомни функции приведения int(), float(), str()." \
+                              % (name, actual, tname)
+        #: булевы выражения, которые обязаны быть True
+        for expr in task.get("expect_true", []):
+            found, value = sandbox.eval_expr(expr)
+            if not found or value is not True:
+                return False, u"Выражение «%s» должно давать True, а получилось " \
+                              u"%r. Проверь операторы сравнения." % (expr, value)
+        #: булевы выражения, которые обязаны быть False
+        for expr in task.get("expect_false", []):
+            found, value = sandbox.eval_expr(expr)
+            if not found or value is not False:
+                return False, u"Выражение «%s» должно давать False, а получилось " \
+                              u"%r. Помни: == сравнивает, а = просто присваивает." \
+                              % (expr, value)
         for name, expected in task.get("expect_vars", {}).items():
             found, value = sandbox.eval_expr(name)
             if not found:
@@ -193,6 +231,11 @@ class BaseLevel(object):
             "prints_in_order": spec.get("prints_in_order", False),
             "require_comment": spec.get("require_comment", False),
             "comment_keywords": spec.get("comment_keywords"),
+            "expect_print_count": spec.get("expect_print_count"),
+            "assert_vars": spec.get("assert_vars", {}),
+            "expect_types": spec.get("expect_types", {}),
+            "expect_true": spec.get("expect_true", []),
+            "expect_false": spec.get("expect_false", []),
         }
         ok, feedback = BaseLevel.check_task(virtual_task, sandbox, source)
         if ok:

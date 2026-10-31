@@ -545,18 +545,18 @@ class CodeSandbox:
         inputs = getattr(self, "_inputs", [])
         injected = {k: v for k, v in self.globals.items()
                     if k in ("canvas", "actor", "keyboard", "check")}
+        read_hook = self.globals.get("read") or self._read_hook
         self.globals = self._make_globals()
         self.globals.update(injected)
+        self.globals["read"] = read_hook
         self._inputs = inputs
-        if inputs:
-            self.globals["read"] = self._read_hook
         self.last_error = None
         self.last_exception = None
 
     def inject(self, **names):
         """Передать в код ученика объекты (actor, canvas_api, check...)."""
         self.globals.update(names)
-        self.globals["read"] = self._read_hook
+        self.globals.setdefault("read", self._read_hook)
 
     # ------------------------------------------------------------- запуск
     def run(self, source):
