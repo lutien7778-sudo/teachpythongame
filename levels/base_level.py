@@ -122,10 +122,13 @@ class BaseLevel(object):
         """Автопроверка задачи ученика.
 
         Возвращает (ok: bool, feedback: str). Проверяются:
-        * ``must_run``   — код обязан выполниться без ошибок;
-        * ``expect_print``— список подстрок, которые обязаны появиться в print();
-        * ``expect_vars`` — dict {имя: ожидаемое значение} после запуска;
-        * ``forbidden``  — подстроки, которых в коде быть не должно.
+        * ``must_run``       — код обязан выполниться без ошибок;
+        * ``expect_print``   — список подстрок, которые обязаны появиться в print();
+        * ``prints_in_order``— строки expect_print напечатаны именно в этом порядке;
+        * ``forbidden_print``— этих подстрок в выводе быть не должно;
+        * ``require_comment``— нужная команда отключена комментарием #, а не удалена;
+        * ``expect_vars``    — dict {имя: ожидаемое значение} после запуска;
+        * ``forbidden``      — подстроки, которых в коде быть не должно.
         """
         if not task:
             return False, u"Задача не задана."
@@ -140,11 +143,66 @@ class BaseLevel(object):
             err = sandbox.last_error
             return False, u"Код завершился с ошибкой: %s" % (
                 err if err else "см. терминал")
+        joined = "\n".join(printed)
         for frag in task.get("expect_print", []):
-            joined = "\n".join(printed)
             if str(frag) not in joined:
                 return False, u"Ожидался вывод, содержащий «%s». Получено: %s" % (
                     frag, joined or "<пусто>")
+        for frag in task.get("forbidden_print", []):
+            if str(frag) in joined:
+                return False, u"Так нельзя! В выводе появился запрещённый фрагмент " \
+                              u"«%s». Проверь, все ли лишние команды отключены." % frag
+        if task.get("prints_in_order"):
+            frags = [str(f) for f in task.get("expect_print", [])]
+            pos = [joined.find(f) for f in frags]
+            if pos != sorted(pos) or any(p < 0 for p in pos):
+                return False, u"Команды выполняются строго сверху вниз! Порядок " \
+                              u"вывода должен быть: %s" % " → ".join(frags)
+        if task.get("require_comment"):
+            keywords = task.get("comment_keywords") or [u"СБОЙ"]
+            commented = [l.strip().lower() for l in src.splitlines()
+                         if l.strip().startswith("#")]
+            if not any(any(k.lower() in c for k in keywords) for c in commented):
+                return False, u"Команду нельзя удалять — отключи её комментарием: " \
+                              u"поставь решётку # в начало нужной строки."
+        #: количество строк вывода (например, «ровно 2 строки»)
+        count = task.get("expect_print_count")
+        if count is not None and len(printed) != int(count):
+            return False, u"Программа должна вывести ровно %d стр(ок), " \
+                          u"а вывела %d. Лишние команды отключи комментарием #." \
+                          % (int(count), len(printed))
+        #: проверка значений переменных без print(): dict {имя: ожидаемое}
+        for name, expected in task.get("assert_vars", {}).items():
+            found, value = sandbox.eval_expr(name)
+            if not found:
+                return False, u"Переменная «%s» не создана — посчитай её в коде " \
+                              u"до проверки." % name
+            if value != expected:
+                return False, u"«%s» = %r, а на этой карте Нова-Терры должно " \
+                              u"быть %r." % (name, value, expected)
+        #: проверка типа значения: dict {имя: "int" | "float" | "str" | "bool"}
+        for name, tname in task.get("expect_types", {}).items():
+            found, value = sandbox.eval_expr(name)
+            if not found:
+                return False, u"Переменная «%s» не найдена." % name
+            actual = type(value).__name__
+            if actual != tname:
+                return False, u"«%s» имеет тип %s, а нужен тип %s. " \
+                              u"Вспомни функции приведения int(), float(), str()." \
+                              % (name, actual, tname)
+        #: булевы выражения, которые обязаны быть True
+        for expr in task.get("expect_true", []):
+            found, value = sandbox.eval_expr(expr)
+            if not found or value is not True:
+                return False, u"Выражение «%s» должно давать True, а получилось " \
+                              u"%r. Проверь операторы сравнения." % (expr, value)
+        #: булевы выражения, которые обязаны быть False
+        for expr in task.get("expect_false", []):
+            found, value = sandbox.eval_expr(expr)
+            if not found or value is not False:
+                return False, u"Выражение «%s» должно давать False, а получилось " \
+                              u"%r. Помни: == сравнивает, а = просто присваивает." \
+                              % (expr, value)
         for name, expected in task.get("expect_vars", {}).items():
             found, value = sandbox.eval_expr(name)
             if not found:
@@ -157,6 +215,34 @@ class BaseLevel(object):
     def get_boss_spec(self):
         return self.boss
 
+    def check_console_boss(self, sandbox, source):
+        """Автопроверка консольного босса (этап 4, режим console).
+
+        Собирает виртуальную задачу из спецификации ``self.boss`` и прогоняет
+        её через ``check_task``. Возвращает ``(ok, feedback)``.
+        """
+        spec = self.boss or {}
+        virtual_task = {
+            "prompt": spec.get("desc", ""),
+            "expect_print": spec.get("expect_print", []),
+            "expect_vars": spec.get("expect_vars", {}),
+            "forbidden": spec.get("forbidden", []),
+            "forbidden_print": spec.get("forbidden_print", []),
+            "prints_in_order": spec.get("prints_in_order", False),
+            "require_comment": spec.get("require_comment", False),
+            "comment_keywords": spec.get("comment_keywords"),
+            "expect_print_count": spec.get("expect_print_count"),
+            "assert_vars": spec.get("assert_vars", {}),
+            "expect_types": spec.get("expect_types", {}),
+            "expect_true": spec.get("expect_true", []),
+            "expect_false": spec.get("expect_false", []),
+        }
+        ok, feedback = BaseLevel.check_task(virtual_task, sandbox, source)
+        if ok:
+            feedback = u"🏆 БОСС ПОВЕРЖЕН: %s! %s" % (
+                spec.get("title", u"сектор зачищен"), feedback)
+        return ok, feedback
+
     def build_boss_scene(self, canvas):
         """Подготовить арену босса на SimCanvas (режим PgZero).
 
@@ -165,9 +251,10 @@ class BaseLevel(object):
         """
         spec = self.boss or {}
         arena = spec.get("arena", {})
-        goal_x = arena.get("goal_x", canvas.screen["width"] - 40)
-        goal_y = arena.get("goal_y", canvas.screen["height"] - 60)
-        from_start = arena.get("start", (30, 30))
+        sw, sh = canvas.screen["width"], canvas.screen["height"]
+        goal_x = arena.get("goal_x", sw - 40)
+        goal_y = arena.get("goal_y", sh - 60)
+        from_start = tuple(arena.get("start", (30, 30)))
         speed = arena.get("speed", 3)
         canvas.actor.pos = from_start
         canvas.actor.icon = spec.get("icon", u"🤖")
@@ -180,7 +267,10 @@ class BaseLevel(object):
         canvas.add_walls(walls)
         goal = Actor(canvas, goal_x, goal_y, 34, 34,
                      color="#d29922", icon=u"🚀")
-        state = {"won": False, "lost": False}
+        #: необязательные собираемые бонусы арены: [(x, y), ...]
+        pickups = [Actor(canvas, px, py, 24, 24, color="#58a6ff", icon=u"⚡")
+                   for (px, py) in spec.get("pickups", [])]
+        state = {"won": False, "lost": False, "collected": 0}
 
         def update(dt):
             kb = canvas.keyboard
@@ -195,6 +285,10 @@ class BaseLevel(object):
                 dy += speed
             canvas.actor.move(dx, dy)
             canvas.actor.clamp_to_screen()
+            for p in pickups:
+                if p.visible and canvas.actor.colliderect(p):
+                    p.visible = False
+                    state["collected"] += 1
             if canvas.collide_with_walls(canvas.actor):
                 state["lost"] = True
                 canvas.stop_game_loop(silent=True)
@@ -205,6 +299,8 @@ class BaseLevel(object):
         def draw():
             for wall in canvas.walls:
                 wall.draw_self()
+            for p in pickups:
+                p.draw_self()
             goal.draw_self()
             canvas.actor.draw_self()
             if state["won"]:
@@ -217,7 +313,7 @@ class BaseLevel(object):
                                    text=u"ЩИТ ПРОБИТ! Старт миссии — кнопка «Миссия»",
                                    fill="#f85149", font=("Courier", 11, "bold"))
         return {"update": update, "draw": draw, "state": state,
-                "goal": goal, "walls": walls}
+                "goal": goal, "walls": walls, "pickups": pickups}
 
     # --------------------------------------------------------- этап 5: тест
     def get_quiz(self):
