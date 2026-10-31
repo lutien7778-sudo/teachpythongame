@@ -77,6 +77,33 @@ def _safe_str(obj):
         return "<нечитаемый объект>"
 
 
+def _printify(obj):
+    """Как настоящий print(): str() для верхнего уровня, repr внутри контейнеров.
+
+    Вложенные элементы контейнеров (list/dict/tuple/set) форматируются через
+    _safe_str — так вывод песочницы совпадает с выводом обычного Python
+    (print('Нова', 1+1) -> 'Нова 2'), но не даёт пользовательскому __repr__
+    выполнить произвольный код вне контроля песочницы.
+    """
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, BaseException):
+        try:
+            return str(obj)
+        except Exception:
+            return "<нечитаемое исключение>"
+    if isinstance(obj, (list, tuple, set, frozenset, dict)):
+        # стандартный repr контейнера сам вызывает repr элементов
+        try:
+            return repr(obj)
+        except Exception:
+            return "<нечитаемый контейнер>"
+    try:
+        return str(obj)
+    except Exception:
+        return _safe_str(obj)
+
+
 # --------------------------------------------------------------------------
 #  AST-трансформер: защита от бесконечных циклов
 # --------------------------------------------------------------------------
@@ -103,7 +130,18 @@ class _LoopGuardTransformer(ast.NodeTransformer):
             name = exc.id
         return name == "SandboxLoopLimit"
 
-    def _wrap(self, node):
+    @staticmethod
+    def _set_coords(node, ln, col):
+        """Проставить координаты узлу (Python 3.8+: fix_missing_locations
+        пропускает узлы с lineno=None, поэтому задаём их явно)."""
+        node.lineno = ln
+        node.col_offset = col
+        if hasattr(node, "end_lineno"):
+            node.end_lineno = ln
+            node.end_col_offset = col
+
+    def _instrument_loop(self, node):
+        """Добавить в тело цикла счётчик итераций и проверку лимита."""
         ctr = self._new_counter()
         incr = ast.parse("%s += 1" % ctr).body[0]
         chk = ast.parse(
@@ -111,30 +149,54 @@ class _LoopGuardTransformer(ast.NodeTransformer):
         ).body[0]
         test = ast.parse("%s > %d" % (ctr, self.limit)).body[0].value
         guard = ast.If(test=test, body=[chk], orelse=[])
-        init = ast.parse("%s = 0" % ctr).body[0]
+        ln = getattr(node, "lineno", 1) or 1
+        col = getattr(node, "col_offset", 0) or 0
+        for n in (guard, chk):
+            if getattr(n, "lineno", None) is None:
+                self._set_coords(n, ln, col)
 
         body = list(node.body)
-        # уже обёрнуто? (повторный проход) — не оборачиваем дважды
-        if body and self._is_guard_raise(body[-1]):
-            pass
-        else:
-            body = body + [incr, guard]
-        node.body = body
-        return ast.fix_missing_locations(
-            ast.Module(body=[init, node], type_ignores=[])
-        )
+        # уже обёрнуто? (защита от повторного прохода) — не оборачиваем дважды
+        if not (body and self._is_guard_raise(body[-1])):
+            # инициализация счётчика как первое выражение тела:
+            # (__nova_ctr := 0) — допустимо и в stmt-, и в expr-контексте
+            # (walrus оператор, Python 3.8+); затем инкремент и проверка.
+            init_expr = ast.parse("(%s := 0)" % ctr).body[0].value
+            first = body[0] if body else None
+            body = [ast.Expr(value=init_expr)] + body + [incr, guard]
+            if first is not None:
+                self._set_coords(body[0], getattr(first, "lineno", ln) or ln,
+                                 getattr(first, "col_offset", col) or col)
+            node.body = body
+        return node
+
+    def visit_Module(self, node):
+        """Обойти все циклы дерева (включая вложенные) и вернуть тот же Module.
+
+        Важно: возвращаем исходный узел Module, а не новый Module внутри
+        другого Module — иначе NodeTransformer построит недопустимое дерево
+        и compile() упадёт с «required field "lineno" missing from stmt».
+        """
+        for i, stmt in enumerate(list(node.body)):
+            new = self.visit(stmt)
+            if new is not None and new is not stmt:
+                node.body[i] = new
+        # инициализация счётчиков вынесена в walrus-выражения внутри тел,
+        # поэтому дополнительных операторов на уровне модуля не нужно
+        ast.fix_missing_locations(node)
+        return node
 
     def visit_For(self, node):
-        self.generic_visit(node)
-        return self._wrap(node)
+        self.generic_visit(node)          # сначала обработаем вложенные циклы
+        return self._instrument_loop(node)
 
     def visit_AsyncFor(self, node):
         self.generic_visit(node)
-        return self._wrap(node)
+        return self._instrument_loop(node)
 
     def visit_While(self, node):
         self.generic_visit(node)
-        return self._wrap(node)
+        return self._instrument_loop(node)
 
 
 class _ForbiddenFinder(ast.NodeVisitor):
@@ -204,8 +266,10 @@ def protect_source(source, iteration_limit=DEFAULT_ITERATION_LIMIT):
 def translate_exception(exc):
     """Возвращает список строк: 'Что пошло не так' + подсказки."""
     lines = []
-    tb_lines = traceback.format_exception(type(exc), exc, exc.tb) \
-        if exc.__traceback__ else traceback.format_exception_only(type(exc), exc)
+    if getattr(exc, "__traceback__", None) is not None:
+        tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    else:
+        tb_lines = traceback.format_exception_only(type(exc), exc)
     where = ""
     for ln in tb_lines:
         s = ln.rstrip("\n")
@@ -335,6 +399,7 @@ class CodeSandbox:
         self.timeout_sec = float(timeout_sec)
         self.globals = self._make_globals()
         self.last_error = None
+        self.last_exception = None
         self.runs = 0
 
     # ------------------------------------------------------------ окружение
@@ -373,10 +438,14 @@ class CodeSandbox:
         if file is not None:
             raise OSError(u"В песочнице print(...) можно вызывать только "
                           u"в терминал игры — параметр file запрещён.")
-        text = sep.join(_safe_str(a) for a in args) + end
-        for line in text.split("\n"):
-            if line != "" or text.endswith("\n"):
-                self.output(line)
+        text = sep.join(_printify(a) for a in args) + end
+        if not text:
+            return
+        lines = text.split("\n")
+        if lines[-1] == "":
+            lines.pop()  # завершающий перевод строки — не пустая «строка вывода»
+        for line in lines:
+            self.output(line)
 
     def feed_input(self, *values):
         """Подготовить ответы для учебной функции read() (эмуляция input())."""
@@ -405,6 +474,7 @@ class CodeSandbox:
         """Выполнить код. Возвращает True, если ошибок нет."""
         self.runs += 1
         self.last_error = None
+        self.last_exception = None
         try:
             compiled, problems = protect_source(source, self.iteration_limit)
         except SyntaxError as e:
@@ -413,7 +483,8 @@ class CodeSandbox:
         if problems:
             for p in problems:
                 self.output(u"[ЗАПРЕЩЕНО] " + p)
-            self.last_error = ValueError(problems[0])
+            self.last_error = u"[ЗАПРЕЩЕНО] " + problems[0]
+            self.last_exception = ValueError(problems[0])
             return False
         if isinstance(compiled, str):
             try:
@@ -443,7 +514,10 @@ class CodeSandbox:
                 self.output(u"[ВРЕМЯ] Код выполнялся %.1f сек — проверь циклы." % dur)
 
     def _report(self, exc):
-        self.last_error = exc
+        # last_error — человекочитаемое русское сообщение (совместимо со str());
+        # last_exception — оригинальный объект исключения для отладки.
+        self.last_error = u" | ".join(translate_exception(exc))
+        self.last_exception = exc
         for line in translate_exception(exc):
             self.output(line)
 
