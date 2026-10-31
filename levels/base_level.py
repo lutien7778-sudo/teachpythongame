@@ -135,7 +135,7 @@ class BaseLevel(object):
         src = (source or "").strip()
         if not src:
             return False, u"Пусто! Напиши код в редакторе и нажми «Запустить»."
-        for bad in task.get("forbidden", []):
+        for bad in task.get("forbidden") or []:
             if bad in src:
                 return False, u"Нельзя использовать «%s» в этом задании." % bad
         ok, printed = sandbox.capture_print(src)
@@ -144,16 +144,21 @@ class BaseLevel(object):
             return False, u"Код завершился с ошибкой: %s" % (
                 err if err else "см. терминал")
         joined = "\n".join(printed)
-        for frag in task.get("expect_print", []):
+        # expect_print может быть списком подстрок, одиночной строкой или None
+        # (None — вывод не проверяется, важны только assert-проверки ниже).
+        expect = task.get("expect_print")
+        if isinstance(expect, str):
+            expect = [expect]
+        for frag in expect or []:
             if str(frag) not in joined:
                 return False, u"Ожидался вывод, содержащий «%s». Получено: %s" % (
                     frag, joined or "<пусто>")
-        for frag in task.get("forbidden_print", []):
+        for frag in task.get("forbidden_print") or []:
             if str(frag) in joined:
                 return False, u"Так нельзя! В выводе появился запрещённый фрагмент " \
                               u"«%s». Проверь, все ли лишние команды отключены." % frag
         if task.get("prints_in_order"):
-            frags = [str(f) for f in task.get("expect_print", [])]
+            frags = [str(f) for f in expect or []]
             pos = [joined.find(f) for f in frags]
             if pos != sorted(pos) or any(p < 0 for p in pos):
                 return False, u"Команды выполняются строго сверху вниз! Порядок " \
@@ -172,7 +177,7 @@ class BaseLevel(object):
                           u"а вывела %d. Лишние команды отключи комментарием #." \
                           % (int(count), len(printed))
         #: проверка значений переменных без print(): dict {имя: ожидаемое}
-        for name, expected in task.get("assert_vars", {}).items():
+        for name, expected in (task.get("assert_vars") or {}).items():
             found, value = sandbox.eval_expr(name)
             if not found:
                 return False, u"Переменная «%s» не создана — посчитай её в коде " \
@@ -181,7 +186,7 @@ class BaseLevel(object):
                 return False, u"«%s» = %r, а на этой карте Нова-Терры должно " \
                               u"быть %r." % (name, value, expected)
         #: проверка типа значения: dict {имя: "int" | "float" | "str" | "bool"}
-        for name, tname in task.get("expect_types", {}).items():
+        for name, tname in (task.get("expect_types") or {}).items():
             found, value = sandbox.eval_expr(name)
             if not found:
                 return False, u"Переменная «%s» не найдена." % name
@@ -191,19 +196,19 @@ class BaseLevel(object):
                               u"Вспомни функции приведения int(), float(), str()." \
                               % (name, actual, tname)
         #: булевы выражения, которые обязаны быть True
-        for expr in task.get("expect_true", []):
+        for expr in task.get("expect_true") or []:
             found, value = sandbox.eval_expr(expr)
             if not found or value is not True:
                 return False, u"Выражение «%s» должно давать True, а получилось " \
                               u"%r. Проверь операторы сравнения." % (expr, value)
         #: булевы выражения, которые обязаны быть False
-        for expr in task.get("expect_false", []):
+        for expr in task.get("expect_false") or []:
             found, value = sandbox.eval_expr(expr)
             if not found or value is not False:
                 return False, u"Выражение «%s» должно давать False, а получилось " \
                               u"%r. Помни: == сравнивает, а = просто присваивает." \
                               % (expr, value)
-        for name, expected in task.get("expect_vars", {}).items():
+        for name, expected in (task.get("expect_vars") or {}).items():
             found, value = sandbox.eval_expr(name)
             if not found:
                 return False, u"Переменная «%s» не создана (код её не определяет)." % name
@@ -224,18 +229,18 @@ class BaseLevel(object):
         spec = self.boss or {}
         virtual_task = {
             "prompt": spec.get("desc", ""),
-            "expect_print": spec.get("expect_print", []),
-            "expect_vars": spec.get("expect_vars", {}),
-            "forbidden": spec.get("forbidden", []),
-            "forbidden_print": spec.get("forbidden_print", []),
+            "expect_print": spec.get("expect_print"),
+            "expect_vars": spec.get("expect_vars") or {},
+            "forbidden": spec.get("forbidden") or [],
+            "forbidden_print": spec.get("forbidden_print") or [],
             "prints_in_order": spec.get("prints_in_order", False),
             "require_comment": spec.get("require_comment", False),
             "comment_keywords": spec.get("comment_keywords"),
             "expect_print_count": spec.get("expect_print_count"),
-            "assert_vars": spec.get("assert_vars", {}),
-            "expect_types": spec.get("expect_types", {}),
-            "expect_true": spec.get("expect_true", []),
-            "expect_false": spec.get("expect_false", []),
+            "assert_vars": spec.get("assert_vars") or {},
+            "expect_types": spec.get("expect_types") or {},
+            "expect_true": spec.get("expect_true") or [],
+            "expect_false": spec.get("expect_false") or [],
         }
         ok, feedback = BaseLevel.check_task(virtual_task, sandbox, source)
         if ok:

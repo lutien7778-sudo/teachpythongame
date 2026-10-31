@@ -202,75 +202,136 @@ class _LoopGuardTransformer(ast.NodeTransformer):
     def _instrument_loop(self, node):
         """Добавить в тело цикла счётчик итераций и проверку лимита.
 
-        Счётчик живёт только время работы цикла: обнуляется при входе
-        (``while (__ctr := 0) < LIMIT and ...`` / ``else``-блок for) и
-        проверяется на каждой итерации — так вложенные циклы не «складывают»
-        свои итерации в один общий счётчик.
+        Счётчик живёт только время работы цикла: список-счётчик регистрируется
+        в служебном dict ``__nova_loop_counters`` (его создаёт песочница) перед
+        циклом, а по выходу из цикла (нормальный конец, ``break`` или
+        исключение) блок ``finally`` удаляет запись — вложенные и повторяющиеся
+        циклы не «складывают» итерации в общий счётчик, а «мусор» не копится
+        между запусками.
+
+        Инкремент оформлен выражением ``list.append(...)``: сам ``append``
+        возвращает ``None``, но длина списка после него — это число итераций,
+        поэтому проверка укладывается в один ``if`` без отдельного присваивания.
+        Узлы строятся вручную через ``_set_coords`` (без ``ast.parse``), чтобы
+        не дублировать тела и не терять координаты строк исходника.
         """
         ctr = self._new_counter()
         ln = getattr(node, "lineno", 1) or 1
         col = getattr(node, "col_offset", 0) or 0
-        incr = ast.parse("%s += 1" % ctr).body[0]
-        chk = ast.parse(
-            "raise SandboxLoopLimit('%s', %d)" % (ctr, self.limit)
-        ).body[0]
-        guard = ast.If(test=ast.parse("%s > %d" % (ctr, self.limit))
-                       .body[0].value, body=[chk], orelse=[])
-        self._set_coords(incr, ln, col)
-        self._set_coords(chk, ln, col)
-        self._set_coords(guard, ln, col)
+
+        counters = ast.Name(id="__nova_loop_counters", ctx=ast.Load())
+        slot = ast.Subscript(value=counters,
+                             slice=ast.Constant(value=ctr), ctx=ast.Load())
+        # len(c) после append() == число итераций; само append() не возвращает
+        # значение — сравнение всегда идёт с int, TypeError невозможен
+        tick = ast.Call(func=ast.Name(id="len", ctx=ast.Load()),
+                        args=[slot], keywords=[])
+        raise_stmt = ast.Raise(
+            exc=ast.Call(func=ast.Name(id="SandboxLoopLimit", ctx=ast.Load()),
+                         args=[ast.Constant(value=ctr),
+                               ast.Constant(value=self.limit)], keywords=[]),
+            cause=None)
+        guard = ast.If(test=ast.Compare(left=tick, ops=[ast.Gt()],
+                                       comparators=[ast.Constant(
+                                           value=self.limit)]),
+                       body=[raise_stmt], orelse=[])
+        for n in ast.walk(guard):
+            self._set_coords(n, ln, col)
 
         body = list(node.body)
         # уже обёрнуто? (защита от повторного прохода) — не оборачиваем дважды
         if body and self._is_guard_raise(body[-1]):
             return node
-        if isinstance(node, ast.While):
-            # while (__ctr := 0) < LIMIT and <условие ученика>:
-            init = ast.Named(target=ast.Name(id=ctr, ctx=ast.Store()),
-                             value=ast.Constant(value=0))
-            self._set_coords(init, ln, col)
-            cmp_ = ast.Compare(left=init, ops=[ast.Lt()],
-                               comparators=[ast.Constant(value=self.limit)])
-            self._set_coords(cmp_, ln, col)
-            test = ast.BoolOp(op=ast.And(), values=[cmp_, node.test])
-            self._set_coords(test, ln, col)
-            node.test = test
-            node.body = body + [incr, guard]
-        else:
-            # for ...: тело; инкремент+проверка; else: __ctr = 0 (сброс)
-            reset = ast.parse("%s = 0" % ctr).body[0]
-            self._set_coords(reset, ln, col)
-            node.body = body + [incr, guard]
-            node.orelse = list(node.orelse) + [reset]
-        return node
+        # в тело цикла добавляются два служебных оператора в конце:
+        #   1) __nova_loop_counters[ctr].append(None)  — инкремент счётчика;
+        #   2) if len(__nova_loop_counters[ctr]) > LIMIT: raise ... — проверка.
+        # len() вызывается ровно один раз в условии if, TypeError невозможен.
+        incr = ast.Expr(value=ast.Call(
+            func=ast.Attribute(value=slot, attr="append", ctx=ast.Load()),
+            args=[ast.Constant(value=None)], keywords=[]))
+        for n in ast.walk(incr):
+            self._set_coords(n, ln, col)
+        guard.test = ast.Compare(left=tick, ops=[ast.Gt()],
+                                 comparators=[ast.Constant(value=self.limit)])
+        for n in ast.walk(guard):
+            self._set_coords(n, ln, col)
+        node.body = body + [incr, guard]
+
+        register = ast.Assign(targets=[ast.Subscript(
+            value=ast.Name(id="__nova_loop_counters", ctx=ast.Load()),
+            slice=ast.Constant(value=ctr), ctx=ast.Store())],
+            value=ast.List(elts=[], ctx=ast.Load()))
+        for n in ast.walk(register):
+            self._set_coords(n, ln, col)
+        unregister = ast.Expr(value=ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id="__nova_loop_counters", ctx=ast.Load()),
+                attr="pop", ctx=ast.Load()),
+            args=[ast.Constant(value=ctr), ast.Constant(value=None)],
+            keywords=[]))
+        for n in ast.walk(unregister):
+            self._set_coords(n, ln, col)
+        cleanup = ast.Try(body=[node], handlers=[], orelse=[],
+                          finalbody=[unregister])
+        self._set_coords(cleanup, ln, col)
+        return register, cleanup
+
+    def _instrument_tree(self, body_list):
+        """Обойти список операторов; вернуть новый список с вставками счётчиков."""
+        out = []
+        for stmt in body_list:
+            if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                inner = self._instrument_tree(stmt.body)
+                if inner is not stmt.body:
+                    stmt.body = inner
+                new = self._instrument_loop(stmt)
+                if isinstance(new, tuple):
+                    out.extend(new)
+                elif new is not None:
+                    out.append(new)
+            else:
+                # рекурсивно спускаемся во все составные операторы
+                for field, value in ast.iter_fields(stmt):
+                    if isinstance(value, list):
+                        newlist = self._instrument_tree(value)
+                        setattr(stmt, field, newlist)
+                out.append(stmt)
+        return out
 
     def visit_Module(self, node):
         """Обойти все циклы дерева (включая вложенные) и вернуть тот же Module.
 
         Важно: возвращаем исходный узел Module, а не новый Module внутри
         другого Module — иначе NodeTransformer построит недопустимое дерево
-        и compile() упадёт с «required field "lineno" missing from stmt».
+        и compile() упадёт с «required field \"lineno\" missing from stmt».
         """
-        for i, stmt in enumerate(list(node.body)):
-            new = self.visit(stmt)
-            if new is not None and new is not stmt:
-                node.body[i] = new
-        # инициализация счётчиков вынесена в walrus-выражения внутри тел,
-        # поэтому дополнительных операторов на уровне модуля не нужно
+        node.body = self._instrument_tree(node.body)
         ast.fix_missing_locations(node)
         return node
 
+    def visit_FunctionDef(self, node):
+        node.body = self._instrument_tree(node.body)
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        node.body = self._instrument_tree(node.body)
+        return node
+
     def visit_For(self, node):
-        self.generic_visit(node)          # сначала обработаем вложенные циклы
-        return self._instrument_loop(node)
+        # вызывается только через _instrument_tree; на прямые generic_visit
+        # пути оставляем безопасное поведение — обойти вложенные и обернуть
+        inner = self._instrument_tree(node.body)
+        node.body = inner
+        res = self._instrument_loop(node)
+        return res[1] if isinstance(res, tuple) else res
 
     def visit_AsyncFor(self, node):
-        self.generic_visit(node)
-        return self._instrument_loop(node)
+        return self.visit_For(node)
 
     def visit_While(self, node):
-        self.generic_visit(node)
-        return self._instrument_loop(node)
+        return self.visit_For(node)
 
 
 class _ForbiddenFinder(ast.NodeVisitor):
@@ -488,6 +549,9 @@ class CodeSandbox:
         g["__import__"] = self._restricted_import
         g["print"] = self._print_hook
         g["SandboxLoopLimit"] = SandboxLoopLimit
+        # служебный dict счётчиков циклов: его создаёт песочница, AST-трансформер
+        # регистрирует в нём по списку на каждый цикл (и удаляет по выходе)
+        g["__nova_loop_counters"] = {}
         g["math"] = __import__("math")
         g["random"] = __import__("random")
         g["time"] = time
@@ -623,8 +687,26 @@ class CodeSandbox:
         return ok, collected
 
     def eval_expr(self, expr):
-        """Вычислить выражение в среде песочницы (для автопроверки задач)."""
+        """Вычислить выражение (или присваивание) в среде песочницы.
+
+        Для автопроверки задач: ``eval_expr("x")`` вернёт значение переменной
+        ученика; ``eval_expr("x = 5")`` выполнит присваивание и вернёт True.
+        """
         try:
-            return True, eval(expr, self.globals, self.globals)
+            tree = ast.parse(expr.strip())
+        except SyntaxError as e:
+            return False, translate_exception(e)[0]
+        try:
+            if len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr):
+                code = compile(ast.Expression(tree.body[0].value), "<check>", "eval")
+                value = eval(code, self.globals, self.globals)
+                # совместимость с «эталонным» поведением: x = 5 -> 5
+                return True, value
+            exec(compile(tree, "<check>", "exec"), self.globals, self.globals)
+            last = None
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign) and len(tree.body) == 1:
+                    last = self.globals.get(getattr(node.targets[0], "id", ""), True)
+            return True, (last if last is not None else True)
         except BaseException as e:  # noqa: BLE001
             return False, translate_exception(e)[0]

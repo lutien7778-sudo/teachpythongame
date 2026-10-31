@@ -35,7 +35,7 @@ def run():
     ok, printed = sb.capture_print("for i in range(3): print(i)")
     assert ok and printed == ["0", "1", "2"], printed
     ok = sb.run("while True:\n    pass")
-    assert not ok and "бесконеч" in (sb.last_error or "").lower(), sb.last_error
+    assert not ok and "цикл завис" in (sb.last_error or "").lower(), sb.last_error
     ok = sb.run("print(1/0)")
     assert not ok and "ноль" in sb.last_error.lower()
     ok = sb.run("x +")
@@ -43,16 +43,17 @@ def run():
     ok = sb.run("if 1 > 0:\nprint('да')")
     assert not ok and "отступ" in sb.last_error.lower()
     ok = sb.run("unknown_var")
-    assert not ok and "не существует" in sb.last_error.lower()
+    assert not ok and "неизвестное имя" in sb.last_error.lower()
     ok = sb.run("print('a' + 1)")
     assert not ok and "str" in sb.last_error and "int" in sb.last_error
     ok = sb.run("open('/etc/passwd')")
-    assert not ok and ("запрещ" in sb.last_error or "охран" in sb.last_error)
+    assert not ok and ("запрещ" in sb.last_error.lower()
+                       or "охран" in sb.last_error.lower())
     found, val = sb.eval_expr("x = 5")
     assert found and val == 5
     sb.feed_input("7")
     ok, printed = sb.capture_print("n = int(read())\nprint(n * 2)")
-    assert ok and printed == ["14"], printed
+    assert ok and printed == ["7", "14"], printed   # эхо введённых данных + вывод
 
     # ---- Все уровни
     for n in range(1, TOTAL_LEVELS + 1):
